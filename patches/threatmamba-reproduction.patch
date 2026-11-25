@@ -1,0 +1,209 @@
+diff --git a/configs/default.yaml b/configs/default.yaml
+index 919e4d5..0eb3042 100644
+--- a/configs/default.yaml
++++ b/configs/default.yaml
+@@ -32,6 +32,7 @@ train:
+   cl_warmup_epochs: 5   # run BCE only for this many epochs before enabling CL
+   cl_noise_std: 0.05    # Eq. 7: Gaussian feature noise (positive view)
+   cl_edge_drop: 0.1     # Eq. 7: Bernoulli edge mask (positive view)
++  cl_neg_mode: splice   # [ReTrace] splice = original negatives | matched = same-size negatives (Eq. 8)
+ ttp:                    # Stage 3 - TTP extraction module (Eq. 2-5)
+   d_model: 256          # specific to the TTP module. The 48 in Table V is the Stage 5
+                         # classifier width; projecting 768 -> 48 and then discriminating
+diff --git a/src/contrastive.py b/src/contrastive.py
+index 8197dfc..d0aa307 100644
+--- a/src/contrastive.py
++++ b/src/contrastive.py
+@@ -10,7 +10,7 @@ import random
+ 
+ import torch
+ 
+-from .cskg_builder import NODE_TYPES, NT, REL
++from .cskg_builder import NODE_TYPES, NT, REL, truncate_graph
+ 
+ 
+ def pos_view(g: dict, noise_std: float = 0.05, edge_drop: float = 0.1,
+@@ -68,3 +68,48 @@ def neg_splice(g1: dict, g2: dict, tac_order: list[str], phi: int | None = None,
+             "node_types": node_types, "node_values": node_values, "node_sent": node_sent,
+             "x": x, "edges": torch.tensor(edges, dtype=torch.long) if edges else torch.zeros(0, 3, dtype=torch.long),
+             "states": merged_states, "n_sents": max(g1.get("n_sents", 0), g2.get("n_sents", 0) + phi)}
++
++
++# ---------------------------------------------------------------------------------------------
++# [ReTrace] same-size contrastive negatives (optional; the default training path is unchanged)
++def truncate_tail(g: dict, keep_frac: float) -> dict:
++    """Mirror of truncate_graph: keep the LAST k% of the timeline (in State order), drop nodes whose
++    node_sent lies before the cut and keep the edges between the remaining nodes.
++    Note: every node only carries the FIRST sentence that mentions it, so an IOC/TTP first seen
++    before the cut is dropped (an approximation)."""
++    states = g["states"]
++    if not states or keep_frac >= 1.0:
++        return g
++    k = max(1, int(round(len(states) * keep_frac)))
++    min_sent = g["node_sent"][states[-k]]
++    keep = [i for i in range(len(g["node_types"])) if g["node_sent"][i] >= min_sent]
++    remap = {old: new for new, old in enumerate(keep)}
++    keepset = set(keep)
++    edges = [(remap[u], remap[v], r) for u, v, r in g["edges"].tolist()
++             if u in keepset and v in keepset]
++    return {**g,
++            "node_types": [g["node_types"][i] for i in keep],
++            "node_values": [g["node_values"][i] for i in keep],
++            "node_sent": [g["node_sent"][i] for i in keep],
++            "x": g["x"][keep],
++            "edges": torch.tensor(edges, dtype=torch.long) if edges else torch.zeros(0, 3, dtype=torch.long),
++            "states": [remap[s] for s in states[-k:] if s in keepset]}
++
++
++def neg_splice_matched(g1: dict, g2: dict, tac_order: list[str], phi: float | None = None,
++                       rng: random.Random | None = None) -> dict:
++    """Eq. 8 taken literally: the first phi of g1's timeline + the last (1 - phi) of g2's, chained.
++    The negative is about the size of one graph (instead of twice the size, as with neg_splice)."""
++    rng = rng or random
++    if phi is None:
++        phi = rng.uniform(0.2, 0.8)
++    head = truncate_graph(g1, phi)
++    tail = truncate_tail(g2, 1.0 - phi)
++    if not head["node_sent"] or not tail["node_sent"]:
++        return neg_splice(g1, g2, tac_order, rng=rng)
++    off = max(head["node_sent"]) + 1 - min(tail["node_sent"])
++    if off == 0:  # neg_splice treats phi=0 as "pick at random"; for a zero offset shift by one more sentence
++        off = 1
++    out = neg_splice(head, tail, tac_order, phi=off, rng=rng)
++    out["doc_id"] = g1["doc_id"] + "|negm|" + g2["doc_id"]
++    return out
+diff --git a/src/encoder.py b/src/encoder.py
+index 6dbad36..77fb3aa 100644
+--- a/src/encoder.py
++++ b/src/encoder.py
+@@ -75,7 +75,9 @@ def get_encoder(device=None):
+ def encode_doc_cached(doc_id: str, sents: list[str], encoder):
+     """Encode the sentences of one document, cached as .pt keyed by (doc_id, content hash)."""
+     import torch
+-    if getattr(encoder, "is_fake", False):
++    # [ReTrace] encoders with skip_disk_cache=True (retrace.sentcache.CachedSentenceEncoder) manage a
++    # per-SENTENCE cache themselves, so no per-document .pt file is written for every variant.
++    if getattr(encoder, "is_fake", False) or getattr(encoder, "skip_disk_cache", False):
+         return encoder.encode(sents)
+     CACHE.mkdir(parents=True, exist_ok=True)
+     key = hashlib.sha1("\n".join(sents).encode("utf-8", "ignore")).hexdigest()[:16]
+diff --git a/src/evaluate.py b/src/evaluate.py
+index ef8f6cc..2d0a9d7 100644
+--- a/src/evaluate.py
++++ b/src/evaluate.py
+@@ -104,7 +104,7 @@ def eval_tag(tag: str, graphs, y, groups, cfg, device):
+ 
+ 
+ def cmd_eval(args, cfg, device):
+-    graphs = load_graphs("test")
++    graphs = load_graphs("test", cskg_dir=getattr(args, "cskg_dir", None))
+     groups = load_json(PROCESSED / "groups.json")
+     g2i = {g: i for i, g in enumerate(groups)}
+     y = np.array([g2i[g["group"]] for g in graphs])
+@@ -224,6 +224,8 @@ def main():
+     ap.add_argument("tag", help="main | no_mamba | no_cl | no_iochunter | all | "
+                                 "any tag name (e.g. main_lam05 from a grid search)")
+     ap.add_argument("--robustness", action="store_true")
++    ap.add_argument("--cskg-dir", default=None,
++                    help="[ReTrace] read the test CSKGs from another folder (e.g. data/cskg_masked)")
+     ap.add_argument("--validity", action="store_true")
+     ap.add_argument("--config", default=None)
+     ap.add_argument("--device", default=None)
+diff --git a/src/train.py b/src/train.py
+index 9f061dd..0d07809 100644
+--- a/src/train.py
++++ b/src/train.py
+@@ -31,7 +31,7 @@ import random
+ import torch
+ 
+ from .cskg_builder import CSKG_DIR, REL
+-from .contrastive import neg_splice, pos_view
++from .contrastive import neg_splice, neg_splice_matched, pos_view
+ from .losses import bce_loss, info_nce
+ from .model import ThreatMambaModel, collate
+ from .utils import (ATTCK_DIR, OUTPUTS, PROCESSED, load_config, load_json, read_jsonl,
+@@ -51,14 +51,18 @@ def tag_of(args) -> str:
+     return f"{base}_{args.suffix}" if args.suffix else base
+ 
+ 
+-def load_graphs(split: str, limit=None) -> list[dict]:
++def load_graphs(split: str, limit=None, cskg_dir=None) -> list[dict]:
++    """[ReTrace] cskg_dir: read the graphs from another folder (e.g. data/cskg_masked for a model
++    trained on name-masked text). Defaults to CSKG_DIR."""
++    from pathlib import Path
++    base = Path(cskg_dir) if cskg_dir else CSKG_DIR
+     docs = read_jsonl(PROCESSED / "docs.jsonl")
+     docs = [d for d in docs if d["split"] == split]
+     if limit:
+         docs = docs[:limit]
+     out = []
+     for d in docs:
+-        fp = CSKG_DIR / f"{d['doc_id']}.pt"
++        fp = base / f"{d['doc_id']}.pt"
+         if fp.exists():
+             out.append(torch_load(fp))
+     print(f"{split}: {len(out)}/{len(docs)} CSKGs")
+@@ -123,7 +127,9 @@ def run_epoch(model, graphs, labels, groups, cfg, args, device, opt=None, rng=No
+                 for a, ga in enumerate(gs):
+                     cands = [b for b in range(len(gs)) if labels[ids[b]] != labels[ids[a]]] or \
+                             [b for b in range(len(gs)) if b != a]
+-                    row = [neg_splice(ga, gs[rng.choice(cands)], tac_order, rng=rng) for _ in range(K)]
++                    splice = (neg_splice_matched if getattr(args, "cl_neg", "splice") == "matched"
++                              else neg_splice)
++                    row = [splice(ga, gs[rng.choice(cands)], tac_order, rng=rng) for _ in range(K)]
+                     negs.append(row)
+                 flat = [g for row in negs for g in row]
+                 _, z_neg = model(collate(flat, device, drop_rels))
+@@ -158,6 +164,14 @@ def main():
+     ap.add_argument("--seed", type=int, default=None)
+     ap.add_argument("--select-metric", choices=SELECT_METRICS, default=None,
+                     help="checkpoint selection criterion (defaults to the config value)")
++    # [ReTrace]
++    ap.add_argument("--cl-neg", choices=["splice", "matched"], default=None,
++                    help="how CL negatives are built: splice (original, joins two whole graphs) | "
++                         "matched (Eq. 8, same size). Defaults to train.cl_neg_mode")
++    ap.add_argument("--cskg-dir", default=None,
++                    help="CSKG folder to use instead of data/cskg (e.g. data/cskg_masked)")
++    ap.add_argument("--aug-dir", default=None,
++                    help="folder of augmentation graphs <doc_id>__*.pt, added to the TRAINING split only")
+     ap.add_argument("--suffix", default=None, help="tag suffix, used for grid search")
+     args = ap.parse_args()
+     cfg = load_config(args.config)
+@@ -169,7 +183,8 @@ def main():
+ 
+     groups = load_json(PROCESSED / "groups.json")
+     g2i = {g: i for i, g in enumerate(groups)}
+-    graphs = load_graphs("train", args.limit)
++    args.cl_neg = args.cl_neg or str(cfg["train"].get("cl_neg_mode", "splice"))
++    graphs = load_graphs("train", args.limit, cskg_dir=args.cskg_dir)
+     labels = [g2i[g["group"]] for g in graphs]
+     idx = list(range(len(graphs)))
+     rng.shuffle(idx)
+@@ -177,6 +192,16 @@ def main():
+     val_idx, tr_idx = idx[:n_val], idx[n_val:]
+     tr_graphs = [graphs[i] for i in tr_idx]; tr_labels = [labels[i] for i in tr_idx]
+     va_graphs = [graphs[i] for i in val_idx]; va_labels = [labels[i] for i in val_idx]
++    if args.aug_dir:
++        # augmentation only for documents of the training split (never touches validation)
++        from pathlib import Path
++        tr_ids = {g["doc_id"] for g in tr_graphs}
++        n_aug = 0
++        for fp in sorted(Path(args.aug_dir).glob("*.pt")):
++            g = torch_load(fp)
++            if g["doc_id"].split("__")[0] in tr_ids and g["group"] in g2i:
++                tr_graphs.append(g); tr_labels.append(g2i[g["group"]]); n_aug += 1
++        print(f"[aug] +{n_aug} augmentation graphs from {args.aug_dir}")
+ 
+     attck = load_json(ATTCK_DIR / "attck_v14.json") if (ATTCK_DIR / "attck_v14.json").exists() else None
+     tac_order = [t["shortname"] for t in attck["tactic_order"]] if attck else []
+@@ -242,7 +267,9 @@ def main():
+                             "train_cfg": {"cl_lambda": lam_cfg, "cl_warmup_epochs": warm,
+                                           "cl_temperature": float(args.tau or cfg["train"]["cl_temperature"]),
+                                           "cl_pairs_K": K, "select_metric": sel,
+-                                          "seed": seed, "best_epoch": ep},
++                                          "seed": seed, "best_epoch": ep,
++                                          "cl_neg_mode": args.cl_neg,
++                                          "cskg_dir": args.cskg_dir, "aug_dir": args.aug_dir},
+                             "val_metrics": dict(va)}, OUTPUTS / f"model_{tag}.pt")
+             else:
+                 wait += 1

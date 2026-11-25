@@ -1,0 +1,68 @@
+# ReTrace configuration (adversarial robustness evaluation). Only the retrace package reads this
+# file; it does not affect the base ThreatMAMBA pipeline.
+run:
+  name: pilot
+  seed: 17
+
+# Models to score. graph = graph checkpoints (outputs/model_<tag>.pt); text = text baselines.
+# Add main_s7/no_cl_s7/... after scripts/train_seeds.sh, main_negm for same-size CL negatives,
+# b1_tfidf/b2_sbert for the text baselines.
+models:
+  graph: [main, no_cl, no_mamba]
+  text: []
+
+keep: [0.2, 0.4, 0.6, 0.8, 1.0]   # timeline cut-offs (report prefixes)
+
+eligible:
+  tier: lenient          # strict (>=3 security terms per 1000 words) | lenient (>=2) | off
+  per_group_cap: 25
+  pilot_n: 50
+  use_llm_cti: false     # true = additionally filter CTI with the LLM (slower)
+
+search:
+  strategy: random       # random | best_of_n | greedy (set with --strategy at run time)
+  n: 5                   # number of candidates for best_of_n
+  greedy_max_items: 10
+
+llm:
+  model: "qwen3.5:9b"
+  temperature: 0.7
+  seed: 17
+  think: false
+  num_ctx: 4096
+
+validate:
+  len_ratio: [0.7, 1.3]  # applied as [0.7*0.6, 1.3*1.6] = [0.42, 2.08] to INV rewrites
+  nli: false             # true = add the bidirectional NLI check (downloads a DeBERTa NLI model)
+  judge: false           # true = add an LLM judge
+
+insert_window: 128       # insertions only go into the region covered by TTP extraction (first 128 sentences)
+confident_tau: 0.5       # "confident flip" threshold
+
+# Parameter grid of every operator. Leave {} to use the operator's default_grid.
+ops:
+  T3: {direction: [contract, expand], touch: [no_regex, regex], k: [all]}
+  T6: {}
+  E1: {k: [1, 2, 3, 5]}
+  E2: {k: [1, 2, 3], mode: [drop]}          # 'neutral' runs in the LLM run (ops_llm)
+  E4: {scope: ["true", "all"]}             # quoted: YAML would read true as a bool
+  E7: {k: [1, 3, 5], type: [mix]}
+  E8: {kind: [ioc, ttp, name], k: [1, 3], target: [runner_up]}   # ioc/ttp need the false-flag pool
+  G1: {type: [IOC, Technique, Tactic], k: [1, all]}
+  G3: {mode: [reverse, shuffle, swap1]}
+  G5: {keep_temporal: [true, false]}
+  T1: {k: [1, 3]}
+  T2: {k: [1, 3]}
+  E5: {mode: [markers, swap], k: [1, 3]}
+  E6: {k: [1, 3]}
+  T4: {}
+  T5: {k: [1, 3, 5], pool: [benign, ttp_free]}
+  G2: {mode: [drop, rewire]}
+  G4: {k: [1, 3], source: [random, runner_up]}
+
+# Grid for the LLM run (runner --ops-section ops_llm): operators that need Ollama.
+ops_llm:
+  T1: {k: [1, 3]}
+  T2: {k: [1, 3]}
+  E2: {k: [1, 2], mode: [neutral]}
+  E6: {k: [1, 3]}

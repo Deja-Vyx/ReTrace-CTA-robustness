@@ -1,0 +1,59 @@
+# =============================================================================================
+# Case-study CTA systems evaluated on the SAME data and the SAME ReTrace benchmark as ThreatMAMBA
+# (levels 1 and 2). Only the cta_systems/ package reads this file; it does NOT affect the base
+# pipeline (configs/default.yaml) or the ReTrace configuration (configs/retrace.yaml).
+#
+#   TTP-Vec   : Hussain & Petrova 2026, Future Internet 18(8):433   -> tag ttp_vec_<algo>
+#   TTP-Match : Guru, Moss & Kochenderfer 2025, arXiv 2505.11547     -> tag ttp_match
+#
+# Every output goes to outputs/cta_systems/ (models, cache, runs, tables, figures, REPORT).
+# =============================================================================================
+seed: 17
+val_frac: 0.15            # stratified validation split (by group) of the 2,515 training reports
+keeps: [0.2, 0.4, 0.6, 0.8, 1.0]   # same as ReTrace; the text cut-off = the sentence ThreatMAMBA uses
+levels: [0, 1, 2]         # 0 = ID (control), 1 = text, 2 = evidence. Level 3 (graph edits) does not apply
+runs: [rand, worst, llm]  # completed ReTrace runs (outputs/retrace/runs/<run>) -> rescore their stored variants
+threatmamba_models: [main]          # ThreatMAMBA columns in the report (add no_cl,no_mamba if needed)
+
+# ---------------------------------------------------------------- TTP-Vec (Hussain & Petrova 2026)
+ttp_vec:
+  algos: [knn, svm, rf, dt, nb]     # the authors' 5 algorithms (scikit-learn, original parameters)
+  weighting: rarity3                # rarity3 = authors' code ((1/number of groups using the TTP)^3, normalised)
+                                    # rarity1 = 1/number of groups | none = unweighted
+  knn_k: 1                          # authors: K=1 works best
+  svm_kernel: linear                # authors: SVC(kernel='linear')
+  svm_max_iter: 1000000             # unlimited in the original code; weights up to 20^3 make libsvm converge very
+                                    # slowly (on synthetic data of the same size: >8 min per fit without a limit;
+                                    # 1e5..1e7 iterations give the same accuracy) - warnings are counted in log/meta
+  cv_folds: 10                      # the paper's protocol (stratified 10-fold) on the training set
+  # models shown in the main comparison tables (every model is scored; the appendix lists all of them)
+  main_table_models: [ttp_vec_knn, ttp_vec_svm, ttp_vec_rf]
+
+# ---------------------------------------------------------------- TTP-Match (Guru et al. 2025)
+ttp_match:
+  embedder: BAAI/bge-large-en-v1.5  # replaces OpenAI text-embedding-3-large with an open model run locally
+  pooling: cls                      # bge: CLS + L2 normalisation
+  max_length: 512
+  batch_size: 64
+  fp16: true                        # only effective on GPU
+  query_prefix: ""                  # bge v1.5 does not require a query prefix
+  window: 3                         # paper: 3-line windows -> here 3 SENTENCES (the texts have no line breaks)
+  desc_chars: 1200                  # length of the ATT&CK technique description that is embedded
+  smoothing: 1.0e-6                 # added to the likelihood so reports without matches fall back to the prior
+  default: {topk: 1, thr_quantile: null, prior: expert}   # the paper's Algorithm 1
+  tune: true                        # choose topk/threshold/prior on validation (mean rank)
+  grid:
+    topk: [1, 2, 3, 5]
+    thr_quantile: [null, 0.5, 0.75]
+    prior: [expert, uniform]
+
+# ---------------------------------------------------------------- adaptive attacks
+# The "strongest" variants of the worst/llm runs are selected with ThreatMAMBA main's scores -> for the
+# other systems they are TRANSFER attacks. Adaptive mode repeats the search against the system ITSELF.
+adaptive:
+  models: [ttp_match, ttp_vec_rf]
+  ops_greedy: [E1, E2, E3]          # same as step C2 of scripts/run_retrace.sh
+  ops_bon: [T5, E4, E5, E7, E8]     # same as step C3 (E8: targeted)
+  ops_llm: []                       # T1,T2,E2,E6 if wanted (needs Ollama; candidates come from the LLM cache)
+  n: 5                              # best-of-N candidates (LLM: 3)
+  n_llm: 3

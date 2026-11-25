@@ -1,0 +1,42 @@
+cff-version: 1.2.0
+title: "ReTrace: adversarial robustness evaluation of cyber threat attribution"
+message: >-
+  If you use this software, please cite the paper listed under preferred-citation.
+  The DOI will be added once the NSS-SocialSec 2026 proceedings are published.
+type: software
+license: MIT
+repository-code: "https://github.com/Deja-Vyx/ReTrace-CTA-robustness"
+authors:
+  - given-names: Chi Vy
+    family-names: Duong
+  - given-names: Hien
+    family-names: Do Hoang
+  - given-names: Van-Hau
+    family-names: Pham
+  - given-names: The Duy
+    family-names: Phan
+keywords:
+  - cyber threat attribution
+  - adversarial robustness
+  - cyber threat intelligence
+  - false flags
+  - graph neural networks
+preferred-citation:
+  type: conference-paper
+  title: "Rewriting the Traces: Adversarial Robustness Evaluation of Temporal Graph-Based Cyber Threat Attribution"
+  authors:
+    - given-names: Chi Vy
+      family-names: Duong
+    - given-names: Hien
+      family-names: Do Hoang
+    - given-names: Van-Hau
+      family-names: Pham
+    - given-names: The Duy
+      family-names: Phan
+  collection-title: "Proceedings of NSS-SocialSec 2026"
+  conference:
+    name: "NSS-SocialSec 2026"
+  publisher:
+    name: Springer
+  year: 2026
+  notes: "Lecture Notes in Computer Science. Accepted, to appear."
